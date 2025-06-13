@@ -1,0 +1,86 @@
+# fusion_module.py
+
+import os
+import cv2
+import torch
+import numpy as np
+from PIL import Image
+from ultralytics import YOLO
+from torchvision import transforms as T
+
+# === Model Setup ===
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Load YOLOv8 model
+yolo_model = YOLO("yolov8m.pt")  # You can change to your desired model
+
+# Load Mask R-CNN model
+mask_model = torch.hub.load("pytorch/vision:v0.10.0", "maskrcnn_resnet50_fpn", pretrained=True)
+mask_model.eval().to(device)
+
+# Image transform for Mask R-CNN
+transform = T.Compose([
+    T.ToTensor()
+])
+
+
+def mask_predict(img):
+    """Run Mask R-CNN on image."""
+    img_tensor = transform(img).unsqueeze(0).to(device)
+    with torch.no_grad():
+        predictions = mask_model(img_tensor)[0]
+    return predictions
+
+
+def get_fused_predictions(img_path, return_annotated=False):
+    """
+    Performs fusion between Mask R-CNN and YOLOv8 detections.
+    Returns slot-level predictions and annotated image.
+    """
+    img = Image.open(img_path).convert("RGB")
+    img_cv2 = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+
+    # === Mask R-CNN ===
+    mask_preds = mask_predict(img)
+    masks = mask_preds.get("masks")
+    boxes = mask_preds.get("boxes")
+
+    if masks is None or boxes is None:
+        return ["empty"], img_cv2 if return_annotated else ["empty"]
+
+    total_slots = masks.shape[0]
+    slot_boxes = boxes.cpu().numpy()
+
+    # === YOLOv8 ===
+    yolo_results = yolo_model(img_path)
+    yolo_boxes = yolo_results[0].boxes.xyxy.cpu().numpy()
+
+    occupied = 0
+    slot_states = []
+
+    for i, slot_box in enumerate(slot_boxes):
+        x1, y1, x2, y2 = slot_box.astype(int)
+        slot_center = [(x1 + x2) // 2, (y1 + y2) // 2]
+
+        is_occupied = False
+        for vbox in yolo_boxes:
+            vx1, vy1, vx2, vy2 = vbox.astype(int)
+            if vx1 <= slot_center[0] <= vx2 and vy1 <= slot_center[1] <= vy2:
+                is_occupied = True
+                occupied += 1
+                break
+
+        slot_states.append("occupied" if is_occupied else "empty")
+
+        # === Visualize ===
+        mask_np = masks[i][0].mul(255).byte().cpu().numpy()
+        color = (0, 0, 255) if is_occupied else (0, 255, 0)
+        img_cv2[mask_np > 127] = color
+
+    # Overlay YOLO detections
+    yolo_annotated = yolo_results[0].plot()
+    fused_image = cv2.addWeighted(img_cv2, 0.6, yolo_annotated, 0.4, 0)
+
+    if return_annotated:
+        return slot_states, fused_image
+    return slot_states
